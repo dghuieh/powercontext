@@ -29,6 +29,7 @@ from powercontext.builtin.artifacts.profile.models import Profile
 from powercontext.builtin.artifacts.topic_memory import TopicMemory, TopicMemorySearchHit
 from powercontext.builtin.runtime.errors import PreparedContextInvariantError
 from powercontext.builtin.runtime.models import PrepareContextRequest, PreparedContext
+from powercontext.builtin.runtime.prepared_evidence import EvidenceCandidate, EvidenceEntry, select_evidence
 from powercontext.builtin.runtime.prepared_code import (
     CodeEvidenceRef,
     PreparedCodeCandidate,
@@ -61,6 +62,7 @@ class _PreparedContextEntry:
     citation: dict[str, object]
     content: str
     truncated: bool
+    span: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -111,6 +113,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[EvidenceFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -123,6 +126,20 @@ class MemoryEntryAddress:
 
 
 PreparedContextOrigin = MemoryCitation | ArtifactRef | MemoryEntryAddress | ArtifactAddress
+
+
+@dataclass(frozen=True)
+class EvidenceFragment:
+    """One literal slice of an entry, with the address needed to read it back.
+
+    ``start`` and ``end`` are Python character coordinates into the versioned entry text and
+    ``text`` is exactly ``entry.text[start:end]``; nothing here is rewritten or generated.
+    """
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
 
 
 @dataclass(frozen=True)
@@ -235,6 +252,13 @@ class PreparedContextBuilder:
 
         if sum(len(candidates.hits) for candidates in memory_candidates) > self.memory_candidate_limit:
             raise PreparedContextInvariantError("memory-candidate-limit")
+
+        if request.evidence_selection:
+            return self._evidence_result(
+                request,
+                current_scope_id=current_scope_id,
+                memory_candidates=memory_candidates,
+            )
         if len(topic_memory_hits) > self.topic_memory_candidate_limit:
             raise PreparedContextInvariantError("topic-memory-candidate-limit")
         if sum(len(candidates.hits) for candidates in experience_candidates) > self.experience_candidate_limit:
@@ -259,6 +283,120 @@ class PreparedContextBuilder:
             context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
             origins=origins,
             omissions=omissions,
+        )
+
+    def _evidence_result(
+        self,
+        request: PrepareContextRequest,
+        *,
+        current_scope_id: str | None,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> PreparedContextBuild:
+        """Deliver literal entry slices chosen for this query, inside the full output budget.
+
+        Evidence selection replaces entry-level packing for Memory only: every delivered item
+        is a character range of one unmodified entry, with the citation that reads it back.
+        The budget is measured on the rendered envelope, so citations and JSON overhead are
+        paid for exactly like text and ``content_bytes`` stays the true output size.
+        """
+
+        entries: list[EvidenceEntry] = []
+        seen: set[tuple[str, str, str]] = set()
+        for candidates in memory_candidates:
+            scope_id = candidates.scope_id or current_scope_id or ""
+            for hit in candidates.hits:
+                key = (scope_id, hit.entry_id, hit.entry_version_id)
+                if key in seen:
+                    continue
+                seen.add(key)
+                memory_ref = hit.memory_ref or candidates.memory_ref
+                if memory_ref is None:
+                    raise PreparedContextInvariantError("memory-ref-missing")
+                if not hit.text.strip():
+                    continue
+                entries.append(
+                    EvidenceEntry(
+                        scope_id=scope_id,
+                        memory_ref=memory_ref,
+                        entry_id=hit.entry_id,
+                        entry_version_id=hit.entry_version_id,
+                        text=hit.text,
+                    )
+                )
+
+        def rendered(selected: Sequence[EvidenceCandidate]) -> tuple[_PreparedContextEntry, ...]:
+            return tuple(self._evidence_entry(current_scope_id, candidate) for candidate in selected)
+
+        def fits(selected: Sequence[EvidenceCandidate], candidate: EvidenceCandidate) -> bool:
+            return _rendered_bytes((*rendered(selected), self._evidence_entry(current_scope_id, candidate))) <= (
+                request.max_bytes
+            )
+
+        chosen = select_evidence(
+            query=request.query,
+            entries=entries,
+            fits=fits,
+            limit=self.entry_limit,
+        )
+        if not chosen:
+            return PreparedContextBuild(context=self.empty(), origins=())
+
+        items = rendered(chosen)
+        content = _render(items)
+        fragments = tuple(
+            EvidenceFragment(
+                address=MemoryEntryAddress(
+                    memory=ArtifactAddress(scope_id=candidate.entry.scope_id, artifact=candidate.entry.memory_ref),
+                    entry_id=candidate.entry.entry_id,
+                    entry_version_id=candidate.entry.entry_version_id,
+                ),
+                start=candidate.start,
+                end=candidate.end,
+                text=candidate.text,
+            )
+            for candidate in chosen
+        )
+        return PreparedContextBuild(
+            context=PreparedContext(
+                status="ready",
+                content=content,
+                content_bytes=len(content.encode("utf-8")),
+            ),
+            origins=tuple(item.origin for item in items),
+            fragments=fragments,
+        )
+
+    def _evidence_entry(
+        self,
+        current_scope_id: str | None,
+        candidate: EvidenceCandidate,
+    ) -> _PreparedContextEntry:
+        entry = candidate.entry
+        address = MemoryEntryAddress(
+            memory=ArtifactAddress(scope_id=entry.scope_id, artifact=entry.memory_ref),
+            entry_id=entry.entry_id,
+            entry_version_id=entry.entry_version_id,
+        )
+        origin: PreparedContextOrigin = address
+        if entry.scope_id == current_scope_id:
+            origin = MemoryCitation(
+                memory_ref=entry.memory_ref,
+                entry_id=entry.entry_id,
+                entry_version_id=entry.entry_version_id,
+            )
+        citation = {
+            "scope_id": entry.scope_id,
+            "memory_ref": entry.memory_ref.model_dump(mode="json"),
+            "entry_id": entry.entry_id,
+            "entry_version_id": entry.entry_version_id,
+        }
+        return _PreparedContextEntry(
+            origin=origin,
+            kind="memory",
+            citation=citation,
+            content=candidate.text,
+            truncated=False,
+            span=(candidate.start, candidate.end),
         )
 
     def probe_budget(
@@ -732,6 +870,8 @@ def _render_entry(entry: _PreparedContextEntry) -> dict[str, object]:
         "content": entry.content,
         "truncated": entry.truncated,
     }
+    if entry.span is not None:
+        rendered["start"], rendered["end"] = entry.span
     if entry.kind != "memory":
         rendered["kind"] = entry.kind
     return rendered
