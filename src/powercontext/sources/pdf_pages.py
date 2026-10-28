@@ -50,6 +50,116 @@ _GENERIC_QUERY_WORDS = frozenset(
 )
 _TOKEN = re.compile(r"[a-z0-9]+")
 
+# Financial statements answer questions through their titles rather than through the
+# wording of the question: a page headed "Consolidated Statement of Income" never says
+# "EBITDA margin", and the pages a filing devotes to litigation never repeat the words a
+# reader uses to ask about them.  Each entry maps question vocabulary to the document
+# structure phrases that carry the same intent in a periodic filing.
+_STRUCTURE_HINTS: tuple[tuple[re.Pattern[str], tuple[str, ...]], ...] = (
+    (
+        re.compile(
+            r"income statement|statement of income|statement of operations|\bp&l\b|\bpnl\b"
+            r"|profit and loss|gross profit|gross margin|operating income|operating profit"
+            r"|\bebitda\b|\bebit\b|net income|net revenue|revenue|net sales|earnings per share"
+            r"|\beps\b|cost of sales|margin"
+        ),
+        (
+            "consolidated statement of income",
+            "consolidated statements of income",
+            "consolidated statements of operations",
+            "statement of income",
+            "statements of operations",
+        ),
+    ),
+    (
+        re.compile(
+            r"cash flow|operating activities|capital expenditure|capex|depreciation|amortization"
+            r"|free cash flow|investing activities|financing activities"
+        ),
+        (
+            "consolidated statement of cash flows",
+            "consolidated statements of cash flows",
+            "statement of cash flows",
+            "statements of cash flows",
+        ),
+    ),
+    (
+        re.compile(
+            r"balance sheet|financial position|total assets|total liabilities|current assets"
+            r"|current liabilities|working capital|accounts receivable|inventories|inventory"
+            r"|shareholders. equity|stockholders. equity"
+        ),
+        (
+            "consolidated balance sheet",
+            "consolidated balance sheets",
+            "consolidated statements of financial position",
+            "balance sheet",
+        ),
+    ),
+    (
+        re.compile(
+            r"legal|lawsuit|litigation|proceeding|court|settlement|claims|antitrust|regulatory"
+            r"|compliance|investigation|fine|penalt"
+        ),
+        (
+            "legal proceedings",
+            "item 3. legal proceedings",
+            "legal matters",
+            "contingencies",
+        ),
+    ),
+    (
+        re.compile(r"geograph|region|regional|country|countries|market|international|worldwide|segment"),
+        ("item 1. business", "geographic", "segments", "our business"),
+    ),
+    (
+        re.compile(r"propert|facilit|plant|warehouse|distribution center|headquarters|real estate"),
+        ("item 2. properties", "properties", "property and equipment"),
+    ),
+    (
+        re.compile(r"risk factor|risk|uncertaint|exposure"),
+        ("risk factors", "item 1a. risk factors"),
+    ),
+    (
+        re.compile(r"employee|headcount|personnel|workforce|human capital|compensation"),
+        ("human capital", "employees", "employee benefits"),
+    ),
+    (
+        re.compile(r"tax|taxes|effective tax rate|deferred tax"),
+        ("income taxes", "taxes on income", "provision for income taxes"),
+    ),
+    (
+        re.compile(r"debt|borrowing|credit facility|bond|note|interest expense|leverage|liquidity"),
+        ("long-term debt", "debt", "borrowings", "notes to consolidated financial statements"),
+    ),
+    (
+        re.compile(r"lease|rent"),
+        ("leases", "lease obligations"),
+    ),
+    (
+        re.compile(r"pension|retirement|postretirement|benefit plan"),
+        ("pension", "retirement", "pension and postretirement benefits"),
+    ),
+    (
+        re.compile(r"goodwill|intangible|impairment|acquisition"),
+        ("goodwill", "intangible assets", "goodwill and intangible assets"),
+    ),
+    (
+        re.compile(r"dividend|share repurchase|buyback|stock repurchase|capital return|payout"),
+        ("dividends", "share repurchases", "stock repurchase", "cash dividends"),
+    ),
+    (
+        re.compile(r"executive|officer|director|governance|board"),
+        ("information about our executive officers", "directors", "corporate governance"),
+    ),
+    (
+        re.compile(r"table of contents|contents|item \d"),
+        ("table of contents",),
+    ),
+)
+_STRUCTURE_WEIGHT = 3.0
+_STRUCTURE_TOP = 4
+
 
 class PDFDocumentInput(BaseModel):
     """Complete original PDF bytes plus the caller-supplied document identity."""
@@ -181,22 +291,84 @@ async def search_pdf_pages(
                 continue
             fused[number] = fused.get(number, 0.0) + 1.0 / (_FUSION_RANK_OFFSET + rank)
 
-    if not fused:
+    structure = await _structure_pages(memory, query, page_citation, entry_page)
+
+    if not fused and not structure:
         return ()
 
     priority: dict[int, float] = {}
+
+    def claim(number: int, value: float) -> None:
+        if number not in page_citation:
+            return
+        if number not in priority or value < priority[number]:
+            priority[number] = value
+
+    # Structural anchors first: a statement title or filing item header is the page a
+    # reader needs even when its wording never repeats the question.  Only the strongest
+    # anchors are admitted so that lexical hits keep their share of the result budget.
+    for position, number in enumerate(structure[:_STRUCTURE_TOP]):
+        claim(number, position * 0.001)
+        claim(number - 1, 4.0 + position * 0.001)
+        claim(number + 1, 4.0 + position * 0.001)
+
     for rank, number in enumerate(sorted(fused, key=lambda page: (-fused[page], page)), start=1):
-        for distance in range(_NEIGHBOUR_DEPTH + 1):
-            candidates = (number,) if distance == 0 else (number - distance, number + distance)
-            for candidate in candidates:
-                if candidate not in page_citation:
-                    continue
-                value = rank + _NEIGHBOUR_PENALTY * distance
-                if candidate not in priority or value < priority[candidate]:
-                    priority[candidate] = value
+        base = 40.0 + rank
+        claim(number, base)
+        for distance in range(1, _NEIGHBOUR_DEPTH + 1):
+            claim(number - distance, base + _NEIGHBOUR_PENALTY * distance)
+            claim(number + distance, base + _NEIGHBOUR_PENALTY * distance)
 
     ordered = sorted(priority, key=lambda page: (priority[page], page))
     return tuple(page_citation[number] for number in ordered[:limit])
+
+
+async def _structure_pages(
+    memory: object,
+    question: str,
+    page_citation: dict[int, MemoryCitation],
+    entry_page: dict[tuple[str, str], int],
+) -> list[int]:
+    """Rank the pages whose title or item header carries the intent of the question."""
+
+    from powercontext.builtin.runtime import GetMemoryEntryRequest, SearchMemoryRequest
+
+    phrases = _structure_readings(question)
+    if not phrases:
+        return ()
+
+    texts: dict[int, str] = {}
+    scores: dict[int, float] = {}
+    for phrase in phrases:
+        result = await memory.search(SearchMemoryRequest(query=phrase, mode="fts", limit=80))
+        matched = 0
+        for hit in result.hits:
+            if matched >= 12:
+                break
+            number = entry_page.get((hit.entry_id, hit.entry_version_id))
+            citation = page_citation.get(number) if number is not None else None
+            if citation is None:
+                citation = MemoryCitation(
+                    memory_ref=hit.memory_ref,
+                    entry_id=hit.entry_id,
+                    entry_version_id=hit.entry_version_id,
+                )
+                if number is None:
+                    record = await memory.get(GetMemoryEntryRequest(citation=citation))
+                    number = _entry_page_number(getattr(record, "entry", record))
+                    if number is None:
+                        continue
+            if number not in texts:
+                record = await memory.get(GetMemoryEntryRequest(citation=page_citation[number]))
+                texts[number] = getattr(record.entry, "text", "") or ""
+            opening, mentioned = _phrase_present(texts[number], phrase)
+            if not mentioned:
+                continue
+            matched += 1
+            increment = (1.0 if opening else 0.45) * _STRUCTURE_WEIGHT
+            scores[number] = scores.get(number, 0.0) + increment
+
+    return sorted(scores, key=lambda page: (-scores[page], page))
 
 
 async def _page_catalogue(memory: object, /) -> tuple[dict[int, MemoryCitation], dict[tuple[str, str], int]]:
@@ -213,6 +385,36 @@ async def _page_catalogue(memory: object, /) -> tuple[dict[int, MemoryCitation],
         page_citation[number] = citation
         entry_page[(citation.entry_id, citation.entry_version_id)] = number
     return page_citation, entry_page
+
+
+def _structure_readings(question: str) -> tuple[str, ...]:
+    """Return the filing-structure phrases implied by the vocabulary of one question."""
+
+    lowered = question.casefold()
+    phrases: list[str] = []
+    for pattern, candidates in _STRUCTURE_HINTS:
+        if pattern.search(lowered):
+            for phrase in candidates:
+                if phrase not in phrases:
+                    phrases.append(phrase)
+    return tuple(phrases)
+
+
+def _phrase_present(text: str, phrase: str) -> tuple[bool, bool]:
+    """Report whether a phrase opens the page body and whether the page mentions it at all."""
+
+    tokens = _TOKEN.findall(text.casefold())
+    wanted = _TOKEN.findall(phrase)
+    if not wanted or not tokens:
+        return False, False
+    head = tokens[:120]
+    for index in range(len(head) - len(wanted) + 1):
+        if head[index : index + len(wanted)] == wanted:
+            return True, True
+    for index in range(len(tokens) - len(wanted) + 1):
+        if tokens[index : index + len(wanted)] == wanted:
+            return False, True
+    return False, False
 
 
 def _readings(query: str) -> tuple[str, ...]:
