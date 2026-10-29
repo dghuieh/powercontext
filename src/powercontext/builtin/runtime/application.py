@@ -328,6 +328,7 @@ logger = logging.getLogger(__name__)
 
 # Leave room for database reads and assembly within the default one-second Hook request.
 _CONTEXT_TOPIC_EMBEDDING_TIMEOUT_SECONDS = 0.25
+_CONTEXT_PACK_CHUNK_BYTES = 512
 
 _MEMORY_CAPTURE_STAGE = "memory.capture"
 _MEMORY_CAPTURE_SOURCE_COUNT = "powercontext.memory.capture.source_count"
@@ -846,6 +847,33 @@ class ScopedContextApplication:
             if authorize_scopes is not None:
                 await authorize_scopes((self.scope_id, *scope.context_references))
             return await self._prepare(request, scope)
+
+    async def prepare_incremental(
+        self,
+        request: PrepareContextRequest,
+        /,
+        *,
+        base_pack: "ContextPack | None" = None,
+        chunk_bytes: int = _CONTEXT_PACK_CHUNK_BYTES,
+        authorize_scopes: Callable[[tuple[str, ...]], Awaitable[None]] | None = None,
+    ) -> "ContextPack | ContextPackDelta":
+        """Prepare this turn's body as a pack, or as a delta against the previous pack.
+
+        The body is always produced by the ordinary ``prepare`` first, so the packing step can
+        neither change what is sent nor what it cites; the caller only chooses the wire form.
+        """
+
+        from powercontext.builtin.runtime.context_pack import ContextPack, ContextPackDelta
+
+        if base_pack is not None and not isinstance(base_pack, ContextPack):
+            from powercontext.builtin.runtime.context_pack import ContextPackError
+
+            raise ContextPackError("base_pack must be a ContextPack")
+        prepared = await self.prepare(request, authorize_scopes=authorize_scopes)
+        pack = ContextPack.from_content(prepared.content or "", chunk_bytes=chunk_bytes)
+        if base_pack is None:
+            return pack
+        return ContextPackDelta.between(base_pack, pack)
 
     async def _prepare(self, request: PrepareContextRequest, scope: ScopeDescriptor, /) -> PreparedContext:
         build, effort = await self._prepare_build(request, scope)
