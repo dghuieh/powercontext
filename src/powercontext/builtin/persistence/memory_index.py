@@ -20,6 +20,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any, Protocol
 
 from sqlalchemy import Table
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from powercontext.artifacts import ArtifactRef
@@ -247,6 +248,16 @@ class CompositeMemoryIndex:
         request: MemorySearchRequest,
         /,
     ) -> MemorySearchChannels:
+        if request.mode == "hybrid":
+            native = tuple(index for index in self.indexes if index.capabilities.hybrid)
+            for index in native:
+                try:
+                    channels = await index.search(connection, scope_id, request)
+                except SQLAlchemyError:
+                    # A deployment whose native dialect rejects the combined
+                    # statement keeps today's two-statement hybrid path.
+                    continue
+                return MemorySearchChannels(fts=channels.fts, vector=channels.vector)
         fts: tuple[MemoryChannelHit, ...] = ()
         vector: tuple[MemoryChannelHit, ...] = ()
         for index in self.indexes:

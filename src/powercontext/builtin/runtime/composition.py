@@ -83,6 +83,7 @@ from powercontext.builtin.inference.usage import (
 from powercontext.builtin.persistence.dream_schema import ensure_dream_schema
 from powercontext.builtin.persistence.memory_index import CompositeMemoryIndex, MemoryIndex
 from powercontext.builtin.persistence.oceanbase.experience_index import OceanBaseExperienceFTSIndex
+from powercontext.builtin.persistence.oceanbase.memory_hybrid import OceanBaseMemoryHybridIndex
 from powercontext.builtin.persistence.oceanbase.memory_index import (
     OceanBaseMemoryFTSIndex,
     OceanBaseMemoryVectorIndex,
@@ -964,7 +965,9 @@ async def open_builtin_contexts(
     experience_index = OceanBaseExperienceFTSIndex()
     indexes = [OceanBaseMemoryFTSIndex()]
     if embedding_model is not None:
-        indexes.append(OceanBaseMemoryVectorIndex(embedding_model.profile))
+        memory_vector_index = OceanBaseMemoryVectorIndex(embedding_model.profile)
+        indexes.append(memory_vector_index)
+        indexes.append(OceanBaseMemoryHybridIndex(memory_vector_index))
     index = CompositeMemoryIndex(*indexes)
     topic_indexes: list[TopicMemoryIndex] = [OceanBaseTopicMemoryFTSIndex()]
     if embedding_model is not None:
