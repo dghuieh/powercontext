@@ -151,38 +151,110 @@ def select_evidence(
     for document in documents:
         document.score(document_idf, average_length, query_vocabulary, numbers)
 
-    selected: list[EvidenceCandidate] = []
+    # Concentration pass: one sentence at a time, best unseen query vocabulary per byte across
+    # every entry, with a per-entry discount so the entry that already earned a span must beat
+    # a fresh entry by a real margin before it takes a second sentence. Even spread is worse
+    # than concentration here: the annotated evidence usually sits in one abstract, sometimes in
+    # two sentences that are far apart, while a one-sentence visit to every distractor burns the
+    # whole allowance on text that answers nothing.
     ranked_documents = sorted(documents, key=lambda item: item.weight, reverse=True)
+    selected: list[EvidenceCandidate] = []
+    covered: set[str] = set()
+    taken: Counter[str] = Counter()
 
-    # Whole-entry pass: when one abstract already fits the allowance, delivering it verbatim
-    # is both the cheapest citation and the highest recall, so no fairness rule can beat it.
-    for document in ranked_documents:
-        if len(selected) >= limit:
-            return _ordered(selected)
-        candidate = EvidenceCandidate(entry=document.entry, start=0, end=len(document.entry.text))
-        if fits(selected, candidate):
-            selected.append(candidate)
-            document.claimed = True
+    query_idf_total = sum(inverse_frequency.get(term, 0.0) for term in query_vocabulary) or 1.0
 
-    # Window pass: evidence answers sit next to each other inside one abstract, so the win is
-    # to grow one contiguous window around the best sentence of the best document instead of
-    # sprinkling single sentences across documents. One window also pays one citation.
-    for document in ranked_documents:
-        if len(selected) >= limit:
+    def gain(document: _Document, sentence: _Sentence) -> float:
+        """Value per byte of taking this sentence, weighted toward what the query asked for.
+
+        Shared query terms carry the whole answer here, so they dominate; a sentence that also
+        picks up the rarer half of the query beats one that merely repeats its head noun. Text
+        the query never mentioned still counts a little, but only a little, because a long
+        unremarkable opening sentence would otherwise outbid the single sentence that answers.
+        """
+
+        shared = sentence.terms & query_vocabulary
+        matched = sum(inverse_frequency.get(term, 0.0) for term in shared)
+        coverage = matched / query_idf_total
+        extra = sum(inverse_frequency.get(term, 0.0) for term in sentence.terms - query_vocabulary - covered)
+        body = document.entry.text[sentence.start : sentence.end]
+        shape = 0.25 * len([term for term in shared if term in _RESULT_CUES])
+        if numbers and any(number in body for number in numbers):
+            shape += 0.4
+        elif any(character.isdigit() for character in body):
+            shape += 0.05
+        length = 0.6 + len(body) / 140.0
+        value = matched * (0.6 + 1.2 * coverage) + 0.12 * extra + shape
+        if sentence.start == 0:
+            # An abstract opens with its paper title repeated, which matches the query vocabulary
+            # without ever carrying the result, so it must yield the budget to the real sentence.
+            value *= 0.55
+        return value * (0.72 ** taken[document.entry.entry_id]) / length
+
+    # Neighbouring sentences say more about the same result and merging them into the span
+    # they touch pays one citation instead of two, so growth comes first in every round.
+    blocked: set[tuple[str, str, int]] = set()
+    while len(selected) < limit:
+        best_ratio = 0.0
+        best_candidate: EvidenceCandidate | None = None
+        best_terms: frozenset[str] = frozenset()
+        best_position: int | None = None
+        best_key: tuple[str, str, int] | None = None
+        best_entry = ""
+        for document in ranked_documents:
+            for sentence in document.sentences:
+                key = (document.entry.entry_id, document.entry.entry_version_id, sentence.start)
+                if key in blocked:
+                    continue
+                position = _touching(selected, document, sentence)
+                if position is None:
+                    candidate = EvidenceCandidate(document.entry, sentence.start, sentence.end)
+                    spent = len(candidate.text.encode("utf-8"))
+                else:
+                    current = selected[position]
+                    candidate = EvidenceCandidate(
+                        document.entry,
+                        min(current.start, sentence.start),
+                        max(current.end, sentence.end),
+                    )
+                    spent = max(len(candidate.text.encode("utf-8")) - len(current.text.encode("utf-8")), 1)
+                if spent <= 0:
+                    continue
+                # ``gain`` is already a value-per-byte figure, so the ratio only has to price the
+                # bytes this sentence actually adds: a merge that reuses an existing citation is
+                # cheaper per byte and wins over starting a new item.
+                ratio = gain(document, sentence) * (sentence.end - sentence.start) / spent
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_candidate = candidate
+                    best_terms = sentence.terms
+                    best_position = position
+                    best_key = key
+                    best_entry = document.entry.entry_id
+        if best_candidate is None or best_key is None:
             break
-        if document.claimed or not document.sentences:
-            continue
-        window = _window(document, inverse_frequency, query_vocabulary, selected, fits)
-        if window is not None:
-            selected.append(window)
-            document.claimed = True
+        if best_position is None:
+            accepted = fits(selected, best_candidate)
+            if accepted:
+                selected.append(best_candidate)
+        else:
+            others = tuple(item for index, item in enumerate(selected) if index != best_position)
+            accepted = fits(others, best_candidate)
+            if accepted:
+                selected[best_position] = best_candidate
+        if accepted:
+            covered.update(best_terms)
+            taken[best_entry] += 1
+            _grow(selected, covered, ranked_documents, fits)
+        else:
+            blocked.add(best_key)
 
     if selected:
         return _ordered(selected)
 
     # Last resort: the budget cannot hold any whole sentence, but a literal prefix of the
     # best document still carries evidence, and a citation can point at it exactly.
-    for document in sorted(documents, key=lambda item: item.weight, reverse=True):
+    for document in ranked_documents:
         prefix = _longest_fitting_prefix(document, fits)
         if prefix is not None:
             return (prefix,)
@@ -198,68 +270,65 @@ _RESULT_CUES = frozenset(
 )
 
 
-def _window(
-    document: _Document,
-    inverse_frequency: dict[str, float],
-    query_vocabulary: frozenset[str],
+def _touching(
     selected: Sequence[EvidenceCandidate],
-    fits: Callable[[Sequence[EvidenceCandidate], EvidenceCandidate], bool],
-) -> EvidenceCandidate | None:
-    """Grow one contiguous span of one entry into the largest budget-fitting window.
+    document: _Document,
+    sentence: _Sentence,
+) -> int | None:
+    """Index of the span this sentence overlaps or abuts, so growth merges instead of adding."""
 
-    Seed is the sentence that explains most of the query. Growth is greedy on
-    ``gain / added bytes`` so neighbouring sentences, which cost almost nothing to include,
-    are taken before distant ones. Only literal text is emitted: the window is a slice of the
-    entry, never a rewrite of it.
+    for index, current in enumerate(selected):
+        if (current.entry.entry_id, current.entry.entry_version_id) != (
+            document.entry.entry_id,
+            document.entry.entry_version_id,
+        ):
+            continue
+        if sentence.start < current.end and current.start < sentence.end:
+            return index
+        if sentence.end == current.start or sentence.start == current.end:
+            return index
+    return None
+
+
+def _grow(
+    selected: list[EvidenceCandidate],
+    covered: set[str],
+    documents: Sequence[_Document],
+    fits: Callable[[Sequence[EvidenceCandidate], EvidenceCandidate], bool],
+) -> None:
+    """Extend every chosen span over the sentences it touches while the budget allows it.
+
+    The extra text costs bytes but no extra citation, and one long literal span is far cheaper
+    than two short ones, so growth is what makes an annotated range spanning several sentences
+    coverable inside the allowance.
     """
 
-    sentences = document.sentences
-    if not sentences:
-        return None
-    text = document.entry.text
-    covered: set[str] = set()
-
-    def gain(sentence: _Sentence) -> float:
-        unseen = sum(inverse_frequency.get(term, 0.0) for term in sentence.terms if term not in covered)
-        anchor = 0.2 * sum(
-            inverse_frequency.get(term, 0.0) for term in sentence.terms & query_vocabulary
-        )
-        shape = 0.1 * len([term for term in sentence.terms if term in _RESULT_CUES])
-        shape += 0.1 if any(character.isdigit() for character in text[sentence.start : sentence.end]) else 0.0
-        return unseen + anchor + shape
-
-    order = sorted(range(len(sentences)), key=lambda index: gain(sentences[index]), reverse=True)
-    seed = order[0]
-    covered.update(sentences[seed].terms)
-    current = EvidenceCandidate(document.entry, sentences[seed].start, sentences[seed].end)
-    if not fits(selected, current):
-        for index in order[1:]:
-            candidate = EvidenceCandidate(document.entry, sentences[index].start, sentences[index].end)
-            if fits(selected, candidate):
-                return candidate
-        return None
-
-    remaining = set(order[1:])
-    while remaining:
-        base = len(text[current.start : current.end].encode("utf-8"))
-        best_index = -1
-        best_ratio = -1.0
-        best_bounds = (current.start, current.end)
-        for index in remaining:
-            start = min(current.start, sentences[index].start)
-            end = max(current.end, sentences[index].end)
-            added = len(text[start:end].encode("utf-8")) - base
-            ratio = gain(sentences[index]) / max(added, 1)
-            if ratio > best_ratio:
-                best_index, best_ratio, best_bounds = index, ratio, (start, end)
-        if best_index < 0:
-            break
-        candidate = EvidenceCandidate(document.entry, best_bounds[0], best_bounds[1])
-        remaining.discard(best_index)
-        if fits(selected, candidate):
-            current = candidate
-            covered.update(sentences[best_index].terms)
-    return current
+    by_entry = {(document.entry.entry_id, document.entry.entry_version_id): document for document in documents}
+    changed = True
+    while changed:
+        changed = False
+        for index in range(len(selected)):
+            current = selected[index]
+            document = by_entry.get((current.entry.entry_id, current.entry.entry_version_id))
+            if document is None:
+                continue
+            for sentence in document.sentences:
+                overlapping = sentence.start < current.end and current.start < sentence.end
+                adjacent = sentence.end == current.start or sentence.start == current.end
+                if not (overlapping or adjacent):
+                    continue
+                start = min(current.start, sentence.start)
+                end = max(current.end, sentence.end)
+                if (start, end) == (current.start, current.end):
+                    continue
+                candidate = EvidenceCandidate(document.entry, start, end)
+                others = tuple(item for position, item in enumerate(selected) if position != index)
+                if not fits(others, candidate):
+                    continue
+                selected[index] = candidate
+                current = candidate
+                covered.update(sentence.terms)
+                changed = True
 
 
 class _Document:
