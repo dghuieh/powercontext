@@ -1,4 +1,4 @@
-﻿# Copyright (c) 2026 OceanBase.
+# Copyright (c) 2026 OceanBase.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,8 +21,8 @@ import io
 import re
 from urllib.parse import quote
 
-from pypdf import PdfReader
 from pydantic import BaseModel
+from pypdf import PdfReader
 
 from powercontext.artifacts import MemoryCitation
 from powercontext.limits import MAX_SOURCE_ID_LENGTH
@@ -37,16 +37,11 @@ SEARCH_PAGE_LIMIT = 400
 _FUSION_RANK_OFFSET = 60
 _NEIGHBOUR_PENALTY = 2.0
 _NEIGHBOUR_DEPTH = 2
+_NEIGHBOUR_SEEDS = 3
+_NEIGHBOUR_BASE = 200.0
 _QUERY_TOKEN = re.compile(r"[A-Za-z][A-Za-z\-]*|\d+(?:\.\d+)?")
 _GENERIC_QUERY_WORDS = frozenset(
-    """
-    a according an and answer are as assume at be been being by calculate can could define
-    defined detail details did do does for from give given has have how i if in into is it
-    its me most my number of on or our please provide question relying respond response
-    show shown state stated term that the their them there these they this those to us use
-    used using value was we were what when where which who why will with within would you
-    your
-    """.split()
+    ["a", "according", "an", "and", "answer", "are", "as", "assume", "at", "be", "been", "being", "by", "calculate", "can", "could", "define", "defined", "detail", "details", "did", "do", "does", "for", "from", "give", "given", "has", "have", "how", "i", "if", "in", "into", "is", "it", "its", "me", "most", "my", "number", "of", "on", "or", "our", "please", "provide", "question", "relying", "respond", "response", "show", "shown", "state", "stated", "term", "that", "the", "their", "them", "there", "these", "they", "this", "those", "to", "us", "use", "used", "using", "value", "was", "we", "were", "what", "when", "where", "which", "who", "why", "will", "with", "within", "would", "you", "your"]
 )
 _TOKEN = re.compile(r"[a-z0-9]+")
 
@@ -87,7 +82,7 @@ _STRUCTURE_HINTS: tuple[tuple[re.Pattern[str], tuple[str, ...]], ...] = (
         re.compile(
             r"balance sheet|financial position|total assets|total liabilities|current assets"
             r"|current liabilities|working capital|accounts receivable|inventories|inventory"
-            r"|shareholders. equity|stockholders. equity"
+            r"|shareholders. equity|stockholders. equity|quick ratio|current ratio|acid test"
         ),
         (
             "consolidated balance sheet",
@@ -106,11 +101,24 @@ _STRUCTURE_HINTS: tuple[tuple[re.Pattern[str], tuple[str, ...]], ...] = (
             "item 3. legal proceedings",
             "legal matters",
             "contingencies",
+            "item 2. properties",
         ),
     ),
     (
-        re.compile(r"geograph|region|regional|country|countries|market|international|worldwide|segment"),
-        ("item 1. business", "geographic", "segments", "our business"),
+        re.compile(
+            r"geograph|region|regional|country|countries|market|international|worldwide|segment"
+            r"|customer|product|categor|backlog|cyclical|seasonal"
+        ),
+        (
+            "geographic operations",
+            "geographic",
+            "segments",
+            "sales and operating income",
+            "by business segment",
+            "summary of business segment data",
+            "item 1. business",
+            "our business",
+        ),
     ),
     (
         re.compile(r"propert|facilit|plant|warehouse|distribution center|headquarters|real estate"),
@@ -121,12 +129,20 @@ _STRUCTURE_HINTS: tuple[tuple[re.Pattern[str], tuple[str, ...]], ...] = (
         ("risk factors", "item 1a. risk factors"),
     ),
     (
-        re.compile(r"employee|headcount|personnel|workforce|human capital|compensation"),
-        ("human capital", "employees", "employee benefits"),
+        re.compile(
+            r"employee|headcount|personnel|workforce|human capital|compensation"
+            r"|retain|retention|churn|card member|business environment"
+        ),
+        ("human capital", "employees", "employee benefits", "business environment", "executive overview"),
     ),
     (
         re.compile(r"tax|taxes|effective tax rate|deferred tax"),
-        ("income taxes", "taxes on income", "provision for income taxes"),
+        (
+            "income taxes",
+            "taxes on income",
+            "provision for income taxes",
+            "summary of financial performance",
+        ),
     ),
     (
         re.compile(r"debt|borrowing|credit facility|bond|note|interest expense|leverage|liquidity"),
@@ -146,7 +162,13 @@ _STRUCTURE_HINTS: tuple[tuple[re.Pattern[str], tuple[str, ...]], ...] = (
     ),
     (
         re.compile(r"dividend|share repurchase|buyback|stock repurchase|capital return|payout"),
-        ("dividends", "share repurchases", "stock repurchase", "cash dividends"),
+        (
+            "dividends",
+            "share repurchases",
+            "stock repurchase",
+            "cash dividends",
+            "consolidated statements of equity",
+        ),
     ),
     (
         re.compile(r"executive|officer|director|governance|board"),
@@ -158,7 +180,23 @@ _STRUCTURE_HINTS: tuple[tuple[re.Pattern[str], tuple[str, ...]], ...] = (
     ),
 )
 _STRUCTURE_WEIGHT = 3.0
-_STRUCTURE_TOP = 4
+_PHRASE_BONUS = 0.18
+_PHRASE_CAP = 3
+_STRUCTURE_TOP = 3
+_ANCHOR_PREFIX = 2.0
+_TABLE_DENSITY_WEIGHT = 0.5
+_TITLE_SIZE = 12
+# Running headers a prose page and a statement page share, so they say nothing about
+# whether the page *is* the statement a question asks for.
+_TITLE_NOISE = frozenset(
+    ["table", "of", "contents", "t", "able", "the", "company", "inc", "plc", "subsidiaries", "corporation", "co", "llc", "ltd", "form", "annual", "report"]
+)
+_DIGIT = re.compile(r"\d")
+# Running-header lines that every page carries, so they cannot identify a page.
+_HEADER_LINES = frozenset(["table of contents", "contents"])
+# Dotted leaders of a table-of-contents entry, e.g. "Item 1. Business...........3".
+_LEADER = re.compile(r"\.{3,}|·{3,}")
+_CONTENTS_DISCOUNT = 0.3
 
 
 class PDFDocumentInput(BaseModel):
@@ -232,7 +270,7 @@ def parse_pdf_document(value: PDFDocumentInput, /) -> tuple[PDFPageInput, ...]:
             page = reader.pages[index]
             try:
                 text = page.extract_text() or ""
-            except Exception as error:  # noqa: BLE001 - any page failure aborts the whole document
+            except Exception as error:
                 raise ValueError(f"pdf page {index + 1} cannot be parsed: {error}") from error
             pages.append(
                 PDFPageInput(
@@ -244,7 +282,7 @@ def parse_pdf_document(value: PDFDocumentInput, /) -> tuple[PDFPageInput, ...]:
             )
     except ValueError:
         raise
-    except Exception as error:  # noqa: BLE001 - every parser failure is an atomic rejection
+    except Exception as error:
         raise ValueError(f"pdf document cannot be parsed: {error}") from error
 
     return tuple(pages)
@@ -258,8 +296,11 @@ async def search_pdf_pages(
     """Return up to ``limit`` distinct exact page citations for one natural-language question.
 
     Retrieval fuses a verbatim reading of the question with a focus reading that drops
-    generic instruction wording, then admits the physical pages adjacent to every strong
-    hit so that prose spanning a page boundary stays reachable.
+    generic instruction wording.  Structural anchors (statement titles and filing item
+    headers) take the first slots because a statement page carries the answer through its
+    title rather than through the wording of the question; the remaining slots are filled
+    with the strongest lexical hits, then with pages adjacent to a strong hit so prose
+    spanning a page boundary stays reachable.
     """
 
     from powercontext.builtin.runtime import GetMemoryEntryRequest, SearchMemoryRequest
@@ -270,7 +311,7 @@ async def search_pdf_pages(
         return ()
 
     query = " ".join(question.split())
-    page_citation, entry_page = await _page_catalogue(memory)
+    page_citation, entry_page, page_text = await _page_catalogue(memory)
     if not page_citation:
         return ()
 
@@ -291,100 +332,165 @@ async def search_pdf_pages(
                 continue
             fused[number] = fused.get(number, 0.0) + 1.0 / (_FUSION_RANK_OFFSET + rank)
 
-    structure = await _structure_pages(memory, query, page_citation, entry_page)
-
+    structure = _structure_pages(query, page_text)
     if not fused and not structure:
         return ()
 
-    priority: dict[int, float] = {}
+    peak = max(fused.values()) if fused else 0.0
+    combined = {number: score / peak for number, score in fused.items()} if peak else {}
+    for number, bonus in _phrase_bonus(query, page_text).items():
+        combined[number] = combined.get(number, 0.0) + bonus
+    density = _table_density(page_text)
+    for number in combined:
+        combined[number] += _TABLE_DENSITY_WEIGHT * density.get(number, 0.0)
 
-    def claim(number: int, value: float) -> None:
-        if number not in page_citation:
-            return
-        if number not in priority or value < priority[number]:
-            priority[number] = value
+    ordered: list[int] = []
+    seen: set[int] = set()
 
-    # Structural anchors first: a statement title or filing item header is the page a
-    # reader needs even when its wording never repeats the question.  Only the strongest
-    # anchors are admitted so that lexical hits keep their share of the result budget.
-    for position, number in enumerate(structure[:_STRUCTURE_TOP]):
-        claim(number, position * 0.001)
-        claim(number - 1, 4.0 + position * 0.001)
-        claim(number + 1, 4.0 + position * 0.001)
+    def admit(number: int) -> None:
+        if number in page_text and number not in seen:
+            seen.add(number)
+            ordered.append(number)
 
-    for rank, number in enumerate(sorted(fused, key=lambda page: (-fused[page], page)), start=1):
-        base = 40.0 + rank
-        claim(number, base)
-        for distance in range(1, _NEIGHBOUR_DEPTH + 1):
-            claim(number - distance, base + _NEIGHBOUR_PENALTY * distance)
-            claim(number + distance, base + _NEIGHBOUR_PENALTY * distance)
+    anchors = structure[:_STRUCTURE_TOP]
+    for position, number in enumerate(anchors[:_STRUCTURE_TOP]):
+        admit(number)
+        if position < 2:
+            admit(number + 1)
 
-    ordered = sorted(priority, key=lambda page: (priority[page], page))
+    for number in sorted(combined, key=lambda page: (-combined[page], page)):
+        if len(ordered) >= limit:
+            break
+        admit(number)
+
+    if len(ordered) < limit:
+        for seed in sorted(combined, key=lambda page: (-combined[page], page))[:_NEIGHBOUR_SEEDS]:
+            if seed not in seen:
+                continue
+            for distance in range(1, _NEIGHBOUR_DEPTH + 1):
+                admit(seed - distance)
+                admit(seed + distance)
+
     return tuple(page_citation[number] for number in ordered[:limit])
 
 
-async def _structure_pages(
-    memory: object,
-    question: str,
-    page_citation: dict[int, MemoryCitation],
-    entry_page: dict[tuple[str, str], int],
-) -> list[int]:
-    """Rank the pages whose title or item header carries the intent of the question."""
+def _structure_pages(question: str, page_text: dict[int, str]) -> list[int]:
+    """Rank the pages whose title carries the intent of the question.
 
-    from powercontext.builtin.runtime import GetMemoryEntryRequest, SearchMemoryRequest
+    A page that is the statement a question asks for spells that intent in its heading,
+    while a page that merely discusses the topic repeats the words somewhere in prose.
+    Only the heading match earns an anchor slot; the prose mention is a weak tie-break.
+    """
 
     phrases = _structure_readings(question)
     if not phrases:
         return ()
-
-    texts: dict[int, str] = {}
-    scores: dict[int, float] = {}
+    wanted_sets: list[tuple[str, ...]] = []
     for phrase in phrases:
-        result = await memory.search(SearchMemoryRequest(query=phrase, mode="fts", limit=80))
-        matched = 0
-        for hit in result.hits:
-            if matched >= 12:
-                break
-            number = entry_page.get((hit.entry_id, hit.entry_version_id))
-            citation = page_citation.get(number) if number is not None else None
-            if citation is None:
-                citation = MemoryCitation(
-                    memory_ref=hit.memory_ref,
-                    entry_id=hit.entry_id,
-                    entry_version_id=hit.entry_version_id,
-                )
-                if number is None:
-                    record = await memory.get(GetMemoryEntryRequest(citation=citation))
-                    number = _entry_page_number(getattr(record, "entry", record))
-                    if number is None:
-                        continue
-            if number not in texts:
-                record = await memory.get(GetMemoryEntryRequest(citation=page_citation[number]))
-                texts[number] = getattr(record.entry, "text", "") or ""
-            opening, mentioned = _phrase_present(texts[number], phrase)
-            if not mentioned:
-                continue
-            matched += 1
-            increment = (1.0 if opening else 0.45) * _STRUCTURE_WEIGHT
-            scores[number] = scores.get(number, 0.0) + increment
+        wanted = tuple(token for token in _TOKEN.findall(phrase) if token not in _TITLE_NOISE)
+        if wanted:
+            wanted_sets.append(wanted)
+    if not wanted_sets:
+        return ()
 
-    return sorted(scores, key=lambda page: (-scores[page], page))
+    density = _table_density(page_text)
+    matches: dict[int, tuple[int, float]] = {}
+    for number, text in page_text.items():
+        title = tuple(_title_tokens(text))
+        best = 0
+        for wanted in wanted_sets:
+            if _contains_sequence(title, wanted):
+                best = max(best, len(wanted))
+        if best:
+            matches[number] = (best, density.get(number, 0.0))
+    return sorted(matches, key=lambda page: (-matches[page][0], -matches[page][1], page))
 
 
-async def _page_catalogue(memory: object, /) -> tuple[dict[int, MemoryCitation], dict[tuple[str, str], int]]:
-    """Map every persisted page of this scope to its citation and hit keys."""
+def _title_tokens(text: str) -> list[str]:
+    """Return the words of the running header and heading that open one page."""
+
+    lines = [line.strip() for line in text.splitlines()]
+    while lines:
+        line = lines[0]
+        if line and " " not in line and any(character.isdigit() or character == "_" for character in line):
+            lines.pop(0)
+            continue
+        if line.casefold() in _HEADER_LINES:
+            lines.pop(0)
+            continue
+        break
+    head = " ".join(" ".join(lines).casefold().split())[:400]
+    return [token for token in _TOKEN.findall(head) if token not in _TITLE_NOISE][:_TITLE_SIZE]
+
+
+def _table_density(page_text: dict[int, str]) -> dict[int, float]:
+    """Measure how much of each page reads like a table, where numeric answers live."""
+
+    density: dict[int, float] = {}
+    for number, text in page_text.items():
+        sample = text[:2500]
+        if not sample:
+            continue
+        value = min(1.0, len(_DIGIT.findall(sample)) / len(sample) * 6)
+        # A table of contents is dense in numbers too, but the numbers there are page
+        # numbers, not the figures a question asks for.
+        if len(_LEADER.findall(sample)) >= 4:
+            value *= _CONTENTS_DISCOUNT
+        density[number] = value
+    return density
+
+
+def _contains_sequence(tokens: tuple[str, ...], wanted: tuple[str, ...]) -> bool:
+    span = len(wanted)
+    if not span or len(tokens) < span:
+        return False
+    first = wanted[0]
+    for index in range(len(tokens) - span + 1):
+        if tokens[index] == first and tokens[index : index + span] == wanted:
+            return True
+    return False
+
+
+def _phrase_bonus(question: str, page_text: dict[int, str]) -> dict[int, float]:
+    """Reward pages that repeat an exact two-word phrase of the question."""
+
+    words = [
+        token
+        for token in _QUERY_TOKEN.findall(question.casefold())
+        if len(token) > 2 and token not in _GENERIC_QUERY_WORDS
+    ]
+    grams = [" ".join(words[index : index + 2]) for index in range(len(words) - 1)]
+    if not grams:
+        return {}
+    bonus: dict[int, float] = {}
+    for number, text in page_text.items():
+        flat = " ".join(text.casefold().split())
+        matched = sum(1 for gram in grams if gram in flat)
+        if matched:
+            bonus[number] = _PHRASE_BONUS * min(matched, _PHRASE_CAP)
+    return bonus
+
+
+async def _page_catalogue(
+    memory: object,
+    /,
+) -> tuple[dict[int, MemoryCitation], dict[tuple[str, str], int], dict[int, str]]:
+    """Map every persisted page of this scope to its citation, hit keys and text."""
 
     listing = await memory.list()
     page_citation: dict[int, MemoryCitation] = {}
     entry_page: dict[tuple[str, str], int] = {}
+    page_text: dict[int, str] = {}
     for record in getattr(listing, "entries", ()):
-        number = _entry_page_number(getattr(record, "entry", None))
+        entry = getattr(record, "entry", None)
+        number = _entry_page_number(entry)
         if number is None:
             continue
         citation = record.citation
         page_citation[number] = citation
         entry_page[(citation.entry_id, citation.entry_version_id)] = number
-    return page_citation, entry_page
+        page_text[number] = getattr(entry, "text", "") or ""
+    return page_citation, entry_page, page_text
 
 
 def _structure_readings(question: str) -> tuple[str, ...]:
