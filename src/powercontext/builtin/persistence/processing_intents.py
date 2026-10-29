@@ -171,6 +171,34 @@ class ArtifactProcessingIntentRepository:
         )
         return cast(StoredArtifactProcessingIntent, await self.load(connection, scope_id, binding_name))
 
+    async def admit_by_count(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        binding_name: str,
+        /,
+    ) -> tuple[StoredArtifactProcessingIntent, bool]:
+        """Accept pending work that reached an independent source-count threshold.
+
+        The caller validates its fence and proves the count in this transaction.
+        Already accepted work is returned untouched so retry state stays authoritative.
+        """
+
+        current = await self.load(connection, scope_id, binding_name, for_update=True)
+        if current is None:
+            raise InvalidRepositoryArgumentError("scope_id", "counted member is not registered")
+        if current.dirty_generation <= current.clean_generation:
+            return current, False
+        if current.requested_generation > current.handled_generation:
+            return current, False
+        table = ARTIFACT_PROCESSING_INTENTS_TABLE
+        await connection.execute(
+            update(table)
+            .where(table.c.scope_id == scope_id, table.c.binding_name == binding_name)
+            .values(requested_generation=current.requested_generation + 1)
+        )
+        return cast(StoredArtifactProcessingIntent, await self.load(connection, scope_id, binding_name)), True
+
     async def scan(
         self,
         connection: AsyncConnection,

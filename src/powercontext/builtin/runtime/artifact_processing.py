@@ -47,6 +47,7 @@ else:
     from multiprocessing.popen_spawn_posix import Popen as SpawnPopen
 
 from powercontext._logging import log_safely
+from powercontext.builtin.persistence.cursors import SourceCursorRepository
 from powercontext.builtin.persistence.database import AsyncDatabase
 from powercontext.builtin.persistence.errors import ArtifactProcessingLeadershipLostError
 from powercontext.builtin.persistence.processing_intents import ArtifactProcessingIntentRepository
@@ -57,7 +58,11 @@ from powercontext.builtin.persistence.supervision import (
     ArtifactProcessingLeaseRepository,
     database_utc_now,
 )
-from powercontext.builtin.persistence.tables import ARTIFACT_PROCESSING_INTENTS_TABLE, ARTIFACT_PROCESSING_LEASES_TABLE
+from powercontext.builtin.persistence.tables import (
+    ARTIFACT_PROCESSING_INTENTS_TABLE,
+    ARTIFACT_PROCESSING_LEASES_TABLE,
+    SOURCE_JOURNAL_HEADS_TABLE,
+)
 from powercontext.builtin.runtime.processing_contracts import (
     ArtifactProcessingWorkAssignment,
     ArtifactProcessingWorkerCompletion,
@@ -76,6 +81,9 @@ _RETRY_BASE_SECONDS = 30.0
 _RETRY_CAP_SECONDS = 1800.0
 _CONTROL_CONFLICT_RETRY_SECONDS = 0.1
 _DISCOVERY_PAGE_SIZE = 100
+# A count threshold has no scheduled deadline, so its condition is re-checked on
+# this bounded poll when nothing else wakes the Supervisor first.
+_COUNT_DISCOVERY_SECONDS = 0.5
 _RETRY_STATE_LIMIT = 1000
 _CHANNEL_QUEUE_LIMIT = _DISCOVERY_PAGE_SIZE // 2
 _DISCOVERY_PAGE_DELAY_SECONDS = 0.01
@@ -110,6 +118,9 @@ class ArtifactProcessingBinding:
     max_workers: int = 1
     worker_timeout_seconds: float = 600.0
     automatic_processing_interval: timedelta | None = None
+    # Independent admission condition: accepted once the unwindowed journal head
+    # is at least this many identities ahead of the Family cursor.
+    automatic_source_count_threshold: int | None = None
     cron: str | None = None
     timezone: str = "Asia/Shanghai"
     config_prefix: str | None = None
@@ -131,6 +142,10 @@ class ArtifactProcessingBinding:
             raise ValueError("max_workers must be a positive integer")  # noqa: TRY003
         if self.worker_timeout_seconds <= 0:
             raise ValueError("worker_timeout_seconds must be positive")  # noqa: TRY003
+        if self.automatic_source_count_threshold is not None and (
+            type(self.automatic_source_count_threshold) is not int or self.automatic_source_count_threshold < 1
+        ):
+            raise ValueError("automatic source count threshold must be a positive integer")  # noqa: TRY003
         if self.automatic_processing_interval is not None:
             if self.automatic_processing_interval.total_seconds() <= 0:
                 raise ValueError("automatic interval must be positive")  # noqa: TRY003
@@ -715,6 +730,9 @@ class ArtifactProcessingSupervisor:
         async with self._database.transaction() as connection:
             await self._leases.require_fence(connection, self._require_current_fence())
             persisted = await self._binding_states.load(connection, binding.binding_name, for_update=True)
+            # The count condition is independent of the interval: it neither
+            # opens nor checks a schedule so the OR never becomes an AND.
+            admitted.extend(await self._admit_counted(connection, state, binding, capacity - len(admitted)))
             enabled = binding.automatic_processing_interval is not None or binding.cron is not None
             if not enabled:
                 if persisted is not None and persisted.scan_in_progress:
@@ -781,6 +799,53 @@ class ArtifactProcessingSupervisor:
         state.next_discovery_at = next_discovery_at
         for scope in admitted:
             self._enqueue(state, scope)
+
+    async def _admit_counted(
+        self,
+        connection: AsyncConnection,
+        state: _FamilyState,
+        binding: ArtifactProcessingBinding,
+        limit: int,
+    ) -> list[str]:
+        """Accept Scopes whose unwindowed journal progress reached the threshold.
+
+        The count is committed identity minus the Family cursor, so replays and
+        lineage-only writes contribute exactly as many identities as they own.
+        """
+
+        threshold = binding.automatic_source_count_threshold
+        if threshold is None or limit <= 0:
+            return []
+        accepted: list[str] = []
+        cursors = SourceCursorRepository()
+        heads = SOURCE_JOURNAL_HEADS_TABLE
+        rows = await self._intents.scan(
+            connection,
+            binding.binding_name,
+            limit=_DISCOVERY_PAGE_SIZE,
+            dirty_only=True,
+        )
+        for row in rows:
+            if len(accepted) >= limit:
+                break
+            scope = row.scope_id
+            if scope in state.queued or scope in state.running or scope in state.retries:
+                continue
+            position = await connection.scalar(select(heads.c.position).where(heads.c.scope_id == scope))
+            if position is None:
+                continue
+            cursor = await cursors.load(connection, scope, binding.binding_name)
+            consumed = 0 if cursor is None else cursor.cursor.sequence
+            if int(position) - consumed < threshold:
+                continue
+            if binding.automatic_scope_filter is not None:
+                eligible = await binding.automatic_scope_filter(connection, (scope,))
+                if scope not in eligible:
+                    continue
+            _, newly_accepted = await self._intents.admit_by_count(connection, scope, binding.binding_name)
+            if newly_accepted:
+                accepted.append(scope)
+        return accepted
 
     @staticmethod
     def _fresh_capacity(state: _FamilyState) -> int:
@@ -1093,6 +1158,8 @@ class ArtifactProcessingSupervisor:
                 continue
             if state.next_schedule_at is not None:
                 deadlines.append(state.next_schedule_at)
+            if state.binding.automatic_source_count_threshold is not None:
+                deadlines.append(now + _COUNT_DISCOVERY_SECONDS)
             if state.discovery_pending or state.scan_in_progress or not state.reconcile_complete or state.degraded:
                 deadlines.append(max(now, state.next_discovery_at))
         return None if not deadlines else max(0.001, min(deadlines) - now)
