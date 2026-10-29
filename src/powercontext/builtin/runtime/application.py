@@ -248,6 +248,7 @@ from powercontext.builtin.runtime.recall_sufficiency import (
     build_recall_candidates,
     recall_effort,
 )
+from powercontext.builtin.runtime.source_lifecycle import SourceLifecycleApplication
 from powercontext.builtin.runtime.statistics import RelationalScopedStatistics, overview_selection
 from powercontext.builtin.scope import ScopeApplication, ScopeDescriptor, ScopeSelection
 from powercontext.builtin.scope.subject_sources import SubjectSourceService
@@ -298,6 +299,7 @@ if TYPE_CHECKING:
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
     from powercontext.builtin.handoff_report.application import HandoffReportApplication
+    from powercontext.builtin.persistence.database import AsyncDatabase
     from powercontext.builtin.runtime.artifact_processing import ArtifactProcessingSupervisors
 
 
@@ -2695,6 +2697,7 @@ class ScopedTopicMemoryApplication:
                     query_embedding,
                     embedding_timeout_seconds,
                 )
+            result = await self._runtime.lifecycle.for_scope(self.scope_id).filter_topic_hits(result)
         observer = self._runtime._topic_memory_search_observer
         if observer is not None:
             try:
@@ -3055,6 +3058,7 @@ class BuiltinRuntime:
         remote_ingestion: RemoteIngestion | None = None,
         dream_service: DreamService | None = None,
         generation_concurrency: int = 4,
+        database: AsyncDatabase | None = None,
     ) -> None:
         if source_window_limit < 1:
             raise _RuntimeConfigurationError("source_window_limit")
@@ -3063,6 +3067,7 @@ class BuiltinRuntime:
         if scope_cache_size < 1:
             raise _RuntimeConfigurationError("scope_cache_size")
         self._provider = provider
+        self._database = database
         self._capabilities = capabilities
         self._review_service = review_service
         self.profiles = profiles
@@ -3128,6 +3133,7 @@ class BuiltinRuntime:
         self._scheduler: AsyncIOScheduler | None = None
         self._scheduler_runtime_key: str | None = None
         self.sources = SourceApplication(self)
+        self.lifecycle = SourceLifecycleApplication(self)
         self.ingestion = RemoteIngestionApplication(self, remote_ingestion)
         self.code = CodeApplication(self, code_service or CodeService(CodeConfig()))
         self.context = ContextApplication(self)

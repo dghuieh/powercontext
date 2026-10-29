@@ -1180,6 +1180,41 @@ RECURRENCE_OBSERVATION_TABLE = Table(
 
 RECURRENCE_TABLES = (RECURRENCE_MATCH_TABLE, RECURRENCE_OBSERVATION_TABLE)
 
+SOURCE_LIFECYCLE_NODES_TABLE = Table(
+    "pc_source_lifecycle_nodes",
+    SHARED_METADATA,
+    Column("scope_id", identity_string(MAX_SCOPE_ID_LENGTH), primary_key=True),
+    Column("node_id", identity_string(MAX_SOURCE_ID_LENGTH), primary_key=True),
+    Column("family", identity_string(16), nullable=False),
+    Column("ordinal", Integer, nullable=False),
+    Column("reference", _entry_text_type(), nullable=False),
+    Column("parents", _entry_text_type(), nullable=False),
+    Column("policy", identity_string(8), nullable=False),
+    Column("revision", Integer),
+    Column("sequence", Integer),
+    Column("available", Boolean, nullable=False),
+    Column("reason", _entry_text_type()),
+    ForeignKeyConstraint(("scope_id",), ("pc_scopes.scope_id",), ondelete="CASCADE"),
+    UniqueConstraint("scope_id", "ordinal", name="uq_pc_source_lifecycle_nodes_ordinal"),
+    Index("ix_pc_source_lifecycle_nodes_state", "scope_id", "family", "available"),
+    CheckConstraint(
+        "family IN ('source', 'memory', 'topic')",
+        name="ck_pc_source_lifecycle_nodes_family",
+    ),
+    CheckConstraint("policy IN ('all', 'any')", name="ck_pc_source_lifecycle_nodes_policy"),
+    CheckConstraint("ordinal >= 0", name="ck_pc_source_lifecycle_nodes_ordinal"),
+    CheckConstraint(
+        "revision IS NULL OR revision > 0",
+        name="ck_pc_source_lifecycle_nodes_revision_positive",
+    ),
+    CheckConstraint(
+        "sequence IS NULL OR sequence >= 0",
+        name="ck_pc_source_lifecycle_nodes_sequence_nonnegative",
+    ),
+)
+
+SOURCE_LIFECYCLE_TABLES = (SOURCE_LIFECYCLE_NODES_TABLE,)
+
 BUILTIN_TABLES = (
     SCOPE_TABLES
     + SHARED_TABLES
@@ -1187,5 +1222,6 @@ BUILTIN_TABLES = (
     + MEMORY_TABLES
     + STATISTICS_TABLES
     + RECURRENCE_TABLES
+    + SOURCE_LIFECYCLE_TABLES
     + (ARTIFACT_TAGS_TABLE, DREAM_RUNS_TABLE, RECEIPT_MIGRATION_REVIEW_TABLE)
 )
