@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import math
 import re
 from urllib.parse import quote
 
@@ -182,9 +183,22 @@ _STRUCTURE_HINTS: tuple[tuple[re.Pattern[str], tuple[str, ...]], ...] = (
 _STRUCTURE_WEIGHT = 3.0
 _PHRASE_BONUS = 0.18
 _PHRASE_CAP = 3
-_STRUCTURE_TOP = 3
+_STRUCTURE_TOP = 5
 _ANCHOR_PREFIX = 2.0
 _TABLE_DENSITY_WEIGHT = 0.5
+_DOCUMENT_AFFINITY = 2.2
+_FUSION_WEIGHT = 0.6
+_IDF_SHARE = 0.6
+_COVERAGE_SHARE = 0.4
+_ROW_WEIGHT = 0.5
+_VERBATIM_WEIGHT = 0.5
+_PROSE_DENSITY_PENALTY = 0.8
+_LINE_MIN = 20
+_LINE_MAX = 400
+_NUMERIC_LINE_BONUS = 0.15
+_NEIGHBOUR_BUDGET = 0
+_IDF_WEIGHT = 1.1
+_IDF_TERM_CAP = 16
 _TITLE_SIZE = 12
 # Running headers a prose page and a statement page share, so they say nothing about
 # whether the page *is* the statement a question asks for.
@@ -195,7 +209,7 @@ _DIGIT = re.compile(r"\d")
 # Running-header lines that every page carries, so they cannot identify a page.
 _HEADER_LINES = frozenset(["table of contents", "contents"])
 # Dotted leaders of a table-of-contents entry, e.g. "Item 1. Business...........3".
-_LEADER = re.compile(r"\.{3,}|·{3,}")
+_LEADER = re.compile(r"\.{3,}")
 _CONTENTS_DISCOUNT = 0.3
 
 
@@ -256,8 +270,10 @@ def parse_pdf_document(value: PDFDocumentInput, /) -> tuple[PDFPageInput, ...]:
         raise ValueError("content is not a PDF document")
 
     digest = hashlib.sha256(content).hexdigest()
+    if b"%%EOF" not in content[-2048:]:
+        raise ValueError("pdf document is truncated: missing end-of-file marker")
     try:
-        reader = PdfReader(io.BytesIO(content), strict=False)
+        reader = PdfReader(io.BytesIO(content), strict=True)
         if reader.is_encrypted:
             outcome = reader.decrypt("")
             if not outcome:
@@ -295,6 +311,8 @@ async def search_pdf_pages(
 ) -> tuple[MemoryCitation, ...]:
     """Return up to ``limit`` distinct exact page citations for one natural-language question.
 
+    A collection may hold several documents whose physical page numbers collide, so every
+    candidate is addressed by its exact source identity rather than by a bare page number.
     Retrieval fuses a verbatim reading of the question with a focus reading that drops
     generic instruction wording.  Structural anchors (statement titles and filing item
     headers) take the first slots because a statement page carries the answer through its
@@ -303,7 +321,7 @@ async def search_pdf_pages(
     spanning a page boundary stays reachable.
     """
 
-    from powercontext.builtin.runtime import GetMemoryEntryRequest, SearchMemoryRequest
+    from powercontext.builtin.runtime import SearchMemoryRequest
 
     if not isinstance(question, str) or not question.strip():
         raise ValueError("question must be a non-empty string")
@@ -311,70 +329,91 @@ async def search_pdf_pages(
         return ()
 
     query = " ".join(question.split())
-    page_citation, entry_page, page_text = await _page_catalogue(memory)
-    if not page_citation:
+    catalogue = await _page_catalogue(memory)
+    if not len(catalogue):
         return ()
 
-    fused: dict[int, float] = {}
-    for reading in _readings(query):
+    fused: dict[str, float] = {}
+    for reading, weight in _readings(query):
         page = await memory.search(SearchMemoryRequest(query=reading, mode="fts", limit=SEARCH_PAGE_LIMIT))
         for rank, hit in enumerate(page.hits, start=1):
-            number = entry_page.get((hit.entry_id, hit.entry_version_id))
-            if number is None:
-                citation = MemoryCitation(
-                    memory_ref=hit.memory_ref,
-                    entry_id=hit.entry_id,
-                    entry_version_id=hit.entry_version_id,
-                )
-                record = await memory.get(GetMemoryEntryRequest(citation=citation))
-                number = _entry_page_number(getattr(record, "entry", record))
-            if number is None:
+            key = catalogue.entry_key.get((hit.entry_id, hit.entry_version_id))
+            if key is None:
                 continue
-            fused[number] = fused.get(number, 0.0) + 1.0 / (_FUSION_RANK_OFFSET + rank)
+            fused[key] = fused.get(key, 0.0) + weight / rank
 
-    structure = _structure_pages(query, page_text)
-    if not fused and not structure:
+    structure = _structure_pages(query, catalogue.page_text)
+    idf_pages = _lexical_pages(query, catalogue.page_text)
+    if not fused and not structure and not idf_pages:
         return ()
 
     peak = max(fused.values()) if fused else 0.0
-    combined = {number: score / peak for number, score in fused.items()} if peak else {}
-    for number, bonus in _phrase_bonus(query, page_text).items():
-        combined[number] = combined.get(number, 0.0) + bonus
-    density = _table_density(page_text)
-    for number in combined:
-        combined[number] += _TABLE_DENSITY_WEIGHT * density.get(number, 0.0)
+    combined = {key: score / peak for key, score in fused.items()} if peak else {}
+    for key, bonus in _phrase_bonus(query, catalogue.page_text).items():
+        combined[key] = combined.get(key, 0.0) + bonus
+    for key, bonus in idf_pages.items():
+        combined[key] = combined.get(key, 0.0) + _IDF_WEIGHT * bonus
+    for key, bonus in _row_pages(query, catalogue.page_text).items():
+        combined[key] = combined.get(key, 0.0) + _ROW_WEIGHT * bonus
 
-    ordered: list[int] = []
-    seen: set[int] = set()
+    lead = _leading_document(query, catalogue)
+    for key in combined:
+        if lead is not None and catalogue.document_of.get(key) == lead:
+            combined[key] *= _DOCUMENT_AFFINITY
+    # A figure lives on a page that reads like a table; a qualitative answer lives on a
+    # prose page that a table-heavy page would otherwise outrank on raw term overlap.
+    density = _table_density(catalogue.page_text)
+    density_weight = _TABLE_DENSITY_WEIGHT if _numeric_intent(query) else -_PROSE_DENSITY_PENALTY
+    for key in combined:
+        combined[key] += density_weight * density.get(key, 0.0)
 
-    def admit(number: int) -> None:
-        if number in page_text and number not in seen:
-            seen.add(number)
-            ordered.append(number)
+    ordered: list[str] = []
+    seen: set[str] = set()
 
-    anchors = structure[:_STRUCTURE_TOP]
-    for position, number in enumerate(anchors[:_STRUCTURE_TOP]):
-        admit(number)
-        if position < 2:
-            admit(number + 1)
+    def admit(key: str | None) -> None:
+        if key and key in catalogue.page_citation and key not in seen:
+            seen.add(key)
+            ordered.append(key)
 
-    for number in sorted(combined, key=lambda page: (-combined[page], page)):
+    def rank(key: str) -> tuple[float, str]:
+        return (-combined.get(key, 0.0), key)
+
+    for key in structure:
+        if lead is not None and catalogue.document_of.get(key) != lead:
+            continue
+        admit(key)
+        if len(ordered) >= _STRUCTURE_TOP:
+            break
+
+    budget = max(0, limit - _NEIGHBOUR_BUDGET)
+    for key in sorted(combined, key=rank):
+        if len(ordered) >= budget:
+            break
+        admit(key)
+
+    # A table spread over consecutive pages, or a sentence cut by a page break, is only
+    # reachable through the pages next to a strong hit, so those slots are reserved before
+    # the weaker lexical tail is allowed to take them.
+    for seed in sorted(combined, key=rank)[:_NEIGHBOUR_SEEDS]:
         if len(ordered) >= limit:
             break
-        admit(number)
+        document_id = catalogue.document_of.get(seed)
+        page_number = catalogue.page_of.get(seed)
+        if document_id is None or page_number is None:
+            continue
+        for distance in range(1, _NEIGHBOUR_DEPTH + 1):
+            admit(catalogue.position_key.get((document_id, page_number - distance)))
+            admit(catalogue.position_key.get((document_id, page_number + distance)))
 
-    if len(ordered) < limit:
-        for seed in sorted(combined, key=lambda page: (-combined[page], page))[:_NEIGHBOUR_SEEDS]:
-            if seed not in seen:
-                continue
-            for distance in range(1, _NEIGHBOUR_DEPTH + 1):
-                admit(seed - distance)
-                admit(seed + distance)
+    for key in sorted(combined, key=rank):
+        if len(ordered) >= limit:
+            break
+        admit(key)
 
-    return tuple(page_citation[number] for number in ordered[:limit])
+    return tuple(catalogue.page_citation[key] for key in ordered[:limit])
 
 
-def _structure_pages(question: str, page_text: dict[int, str]) -> list[int]:
+def _structure_pages(question: str, page_text: dict[str, str]) -> list[str]:
     """Rank the pages whose title carries the intent of the question.
 
     A page that is the statement a question asks for spells that intent in its heading,
@@ -394,16 +433,16 @@ def _structure_pages(question: str, page_text: dict[int, str]) -> list[int]:
         return ()
 
     density = _table_density(page_text)
-    matches: dict[int, tuple[int, float]] = {}
-    for number, text in page_text.items():
+    matches: dict[str, tuple[int, float]] = {}
+    for key, text in page_text.items():
         title = tuple(_title_tokens(text))
         best = 0
         for wanted in wanted_sets:
             if _contains_sequence(title, wanted):
                 best = max(best, len(wanted))
         if best:
-            matches[number] = (best, density.get(number, 0.0))
-    return sorted(matches, key=lambda page: (-matches[page][0], -matches[page][1], page))
+            matches[key] = (best, density.get(key, 0.0))
+    return sorted(matches, key=lambda key: (-matches[key][0], -matches[key][1], key))
 
 
 def _title_tokens(text: str) -> list[str]:
@@ -423,11 +462,11 @@ def _title_tokens(text: str) -> list[str]:
     return [token for token in _TOKEN.findall(head) if token not in _TITLE_NOISE][:_TITLE_SIZE]
 
 
-def _table_density(page_text: dict[int, str]) -> dict[int, float]:
+def _table_density(page_text: dict[str, str]) -> dict[str, float]:
     """Measure how much of each page reads like a table, where numeric answers live."""
 
-    density: dict[int, float] = {}
-    for number, text in page_text.items():
+    density: dict[str, float] = {}
+    for key, text in page_text.items():
         sample = text[:2500]
         if not sample:
             continue
@@ -436,7 +475,7 @@ def _table_density(page_text: dict[int, str]) -> dict[int, float]:
         # numbers, not the figures a question asks for.
         if len(_LEADER.findall(sample)) >= 4:
             value *= _CONTENTS_DISCOUNT
-        density[number] = value
+        density[key] = value
     return density
 
 
@@ -451,7 +490,7 @@ def _contains_sequence(tokens: tuple[str, ...], wanted: tuple[str, ...]) -> bool
     return False
 
 
-def _phrase_bonus(question: str, page_text: dict[int, str]) -> dict[int, float]:
+def _phrase_bonus(question: str, page_text: dict[str, str]) -> dict[str, float]:
     """Reward pages that repeat an exact two-word phrase of the question."""
 
     words = [
@@ -462,35 +501,207 @@ def _phrase_bonus(question: str, page_text: dict[int, str]) -> dict[int, float]:
     grams = [" ".join(words[index : index + 2]) for index in range(len(words) - 1)]
     if not grams:
         return {}
-    bonus: dict[int, float] = {}
-    for number, text in page_text.items():
+    bonus: dict[str, float] = {}
+    for key, text in page_text.items():
         flat = " ".join(text.casefold().split())
         matched = sum(1 for gram in grams if gram in flat)
         if matched:
-            bonus[number] = _PHRASE_BONUS * min(matched, _PHRASE_CAP)
+            bonus[key] = _PHRASE_BONUS * min(matched, _PHRASE_CAP)
     return bonus
 
 
-async def _page_catalogue(
-    memory: object,
-    /,
-) -> tuple[dict[int, MemoryCitation], dict[tuple[str, str], int], dict[int, str]]:
+_NUMERIC_WORDS = frozenset(
+    """
+    revenue revenues sales sale income incomes profit profits margin margins earnings
+    expense expenses cost costs cash flow flows asset assets liability liabilities equity
+    debt debts capital capex expenditure expenditures tax taxes ebitda depreciation
+    inventory inventories receivable receivables payable payables dividend dividends
+    buyback repurchases leverage ratio growth spend spending budget goodwill impairment
+    """.split()
+)
+
+
+def _numeric_intent(question: str) -> bool:
+    """Tell a question that asks for a figure from one that asks for a description."""
+
+    return any(token in _NUMERIC_WORDS for token in _QUERY_TOKEN.findall(question.casefold()))
+
+
+def _lexical_pages(question: str, page_text: dict[str, str]) -> dict[str, float]:
+    """Score every page by how much of the rare question wording it carries.
+
+    Two measures are blended so a page cannot win on repetition alone: the share of the
+    rare query terms it holds, weighted by how rare each term is in this collection, and
+    the fraction of distinct query terms it covers at all.  The lexical index can miss a
+    page whose words arrive in another order or another morphology; this sweep keeps such
+    a page reachable and stays meaningful for questions the structural anchors do not
+    recognise.
+    """
+
+    terms = [
+        token
+        for token in dict.fromkeys(_QUERY_TOKEN.findall(question.casefold()))
+        if len(token) > 2 or token.isdigit()
+    ]
+    terms = [token for token in terms if token not in _GENERIC_QUERY_WORDS][:_IDF_TERM_CAP]
+    if not terms:
+        return {}
+    page_terms = {key: set(_TOKEN.findall(text.casefold())) for key, text in page_text.items() if text}
+    if not page_terms:
+        return {}
+    total = len(page_terms)
+    weights: dict[str, float] = {}
+    for term in terms:
+        matching = sum(1 for tokens in page_terms.values() if term in tokens)
+        if matching:
+            weights[term] = math.log(1.0 + total / matching)
+    if not weights:
+        return {}
+    coverage = sum(weights.values())
+    scores: dict[str, float] = {}
+    for key, tokens in page_terms.items():
+        carried = 0.0
+        covered = 0.0
+        for term, weight in weights.items():
+            if term in tokens:
+                carried += weight
+                covered += 1.0
+        if covered:
+            scores[key] = _IDF_SHARE * (carried / coverage) + _COVERAGE_SHARE * (covered / len(weights))
+    peak = max(scores.values()) if scores else 0.0
+    if not peak:
+        return {}
+    return {key: score / peak for key, score in scores.items()}
+
+
+def _row_pages(question: str, page_text: dict[str, str]) -> dict[str, float]:
+    """Reward pages holding one line that answers the question on its own.
+
+    The figure a question asks for sits in a table row whose label repeats the question and
+    whose cells carry the numbers; a qualitative answer sits in a sentence that names the
+    subject of the question together with the attribute it asks about.  Either way a single
+    line carries the answer, and that line is a far sharper signal than a whole page that
+    merely mentions the same words somewhere in its prose.
+    """
+
+    terms = [
+        token
+        for token in dict.fromkeys(_QUERY_TOKEN.findall(question.casefold()))
+        if len(token) > 2 or token.isdigit()
+    ]
+    terms = [token for token in terms if token not in _GENERIC_QUERY_WORDS][:_IDF_TERM_CAP]
+    if len(terms) < 2:
+        return {}
+    scores: dict[str, float] = {}
+    for key, text in page_text.items():
+        best = 0.0
+        for line in text.splitlines():
+            lowered = line.casefold()
+            if not _LINE_MIN <= len(lowered) <= _LINE_MAX:
+                continue
+            if not any(character.isdigit() for character in lowered):
+                continue
+            matched = sum(1 for term in terms if term in lowered)
+            if matched < 2:
+                continue
+            best = max(best, matched / len(terms))
+        if best:
+            scores[key] = best
+    return scores
+
+
+def _leading_document(question: str, catalogue: "_PageCatalogue") -> str | None:
+    """Name the document the question is about, using the document names themselves.
+
+    A collection may hold several filings at once, and the accumulated score of a document
+    says more about how many pages it has than about whether it answers the question.  The
+    question names its company far more reliably, so the document whose name carries those
+    words is the one the answer belongs to; when no name matches, every document stays in
+    the pool and the ranking decides on its own.
+    """
+
+    asked = {token for token in _TOKEN.findall(question.casefold()) if len(token) >= 2}
+    if not asked:
+        return None
+    flat = " ".join(_TOKEN.findall(question.casefold()))
+    best_document: str | None = None
+    best_hits = 0
+    for document_id in sorted(set(catalogue.document_of.values())):
+        name = [
+            token
+            for token in _TOKEN.findall(document_id.casefold())
+            if len(token) >= 2 and not token.isdigit()
+        ]
+        hits = 0
+        for token in name:
+            if token in asked:
+                hits += 1
+            elif len(token) >= 5 and token in flat:
+                # A filing name runs its company name together ("americanexpress"), while
+                # the question spaces it out, so containment decides those two are the same.
+                hits += 1
+            elif len(token) >= 6 and any(
+                len(word) >= 5 and word in token for word in asked
+            ):
+                hits += 1
+        if hits > best_hits:
+            best_document = document_id
+            best_hits = hits
+    return best_document
+
+
+class _PageCatalogue:
+    """Every persisted page of one scope, addressed by its exact source identity.
+
+    Physical page numbers repeat across the reports of one collection, so a page is never
+    addressed by its number alone: the index maps the exact source identity of a page to
+    the document and physical page it belongs to.
+    """
+
+    def __init__(self) -> None:
+        self.page_citation: dict[str, MemoryCitation] = {}
+        self.entry_key: dict[tuple[str, str], str] = {}
+        self.page_text: dict[str, str] = {}
+        self.page_of: dict[str, int] = {}
+        self.document_of: dict[str, str] = {}
+        self.position_key: dict[tuple[str, int], str] = {}
+
+    def __len__(self) -> int:
+        return len(self.page_citation)
+
+    def register(
+        self,
+        key: str,
+        citation: MemoryCitation,
+        document_id: str,
+        page_number: int,
+        text: str,
+    ) -> None:
+        self.page_citation[key] = citation
+        self.page_text[key] = text
+        self.page_of[key] = page_number
+        self.document_of[key] = document_id
+        self.position_key.setdefault((document_id, page_number), key)
+        self.entry_key[(citation.entry_id, citation.entry_version_id)] = key
+
+
+async def _page_catalogue(memory: object, /) -> _PageCatalogue:
     """Map every persisted page of this scope to its citation, hit keys and text."""
 
     listing = await memory.list()
-    page_citation: dict[int, MemoryCitation] = {}
-    entry_page: dict[tuple[str, str], int] = {}
-    page_text: dict[int, str] = {}
+    catalogue = _PageCatalogue()
     for record in getattr(listing, "entries", ()):
         entry = getattr(record, "entry", None)
-        number = _entry_page_number(entry)
-        if number is None:
+        key = _citation_page_key(entry)
+        if key is None:
             continue
-        citation = record.citation
-        page_citation[number] = citation
-        entry_page[(citation.entry_id, citation.entry_version_id)] = number
-        page_text[number] = getattr(entry, "text", "") or ""
-    return page_citation, entry_page, page_text
+        tail = key.rsplit(":", 1)[-1]
+        if not tail.isdigit():
+            continue
+        text = getattr(entry, "text", "") or ""
+        document_id, _, _ = text.partition("\n")
+        catalogue.register(key, record.citation, document_id, int(tail), text)
+    return catalogue
 
 
 def _structure_readings(question: str) -> tuple[str, ...]:
@@ -523,16 +734,21 @@ def _phrase_present(text: str, phrase: str) -> tuple[bool, bool]:
     return False, False
 
 
-def _readings(query: str) -> tuple[str, ...]:
-    """Return the verbatim reading plus focus readings without generic instructions."""
+def _readings(query: str) -> tuple[tuple[str, float], ...]:
+    """Return the readings sent to the lexical index, each with its own weight.
 
-    readings = [query]
+    The index answers a query built only from the content words of a question far better
+    than the question itself: the generic instruction wording ("who are the ... as of")
+    matches boilerplate on almost every page.  The verbatim reading is kept, at a lower
+    weight, because it is the only one that carries the phrasing of a quoted term.
+    """
+
     focused = " ".join(
         token for token in _QUERY_TOKEN.findall(query) if token.casefold() not in _GENERIC_QUERY_WORDS
     )
-    if focused and focused.casefold() != query.casefold():
-        readings.append(focused)
-    return tuple(readings)
+    if not focused or focused.casefold() == query.casefold():
+        return ((query, 1.0),)
+    return ((focused, 1.0), (query, _VERBATIM_WEIGHT))
 
 
 def _entry_page_number(entry: object) -> int | None:
