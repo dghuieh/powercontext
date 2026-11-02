@@ -1,0 +1,17 @@
+{
+  "model": "sentence-transformers/all-MiniLM-L6-v2",
+  "runtime": "onnxruntime (CPUExecutionProvider, intra_op=4)",
+  "quantize_seconds": 1.1,
+  "fp32_bytes": 90405214,
+  "int8_bytes": 22903748,
+  "fp32_mb": 86.2,
+  "int8_mb": 21.8,
+  "compression_ratio": 3.95,
+  "embedding_cosine_fp32_vs_int8": [0.9905, 0.9867, 0.9914, 0.9869, 0.9911, 0.9855, 0.9908, 0.9873],
+  "mean_cosine": 0.9888,
+  "top1_same": true,
+  "top3_same": false,
+  "fp32_latency": { "doc_ms_per_text": 27.2, "query_ms_per_text": 26.6 },
+  "int8_latency": { "doc_ms_per_text": 27.4, "query_ms_per_text": 37.4 },
+  "sample_sizes": { "docs": 8, "queries": 4 }
+}

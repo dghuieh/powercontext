@@ -1,0 +1,19 @@
+{
+  "name": "stepfun-seekdb-mini-kb",
+  "version": "1.0.0",
+  "private": true,
+  "description": "浏览器端量化 embedding + seekdb 混合检索的迷你知识库",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "fetch-model": "node scripts/fetch-model.js",
+    "vendor": "node scripts/vendor-transformers.js",
+    "bench": "node benchmark/bench-embed.js"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^3.0.2",
+    "express": "^4.19.2",
+    "iconv-lite": "^0.6.3",
+    "mysql2": "^3.11.0"
+  }
+}
