@@ -72,6 +72,33 @@
 
 ### 5.1 接口层自检
 
+脚本对两种返回形态都做了适配，不会因结构差异崩溃：
+
+| 端点 | 服务端实际返回 | 脚本处理 |
+| --- | --- | --- |
+| `POST /api/v1/memories` | `data` 为**数组**，如 `{"code":0,"data":[{"memory_id":"..."}]}` | 取首元素；`data` 为对象时同样兼容 |
+| `POST /api/v1/memories/search` | `data` 为 `{"results":[...]}` 或直接数组 | 依次尝试 `results/items/memories/records/list` |
+
+**A. 零依赖跑通（--mock，不需要 Docker / seekdb）**
+
+```bash
+python scripts/smoke_test.py --mock
+```
+
+用与服务端同构的桩响应验证判定逻辑（`data` 走数组分支），实跑输出：
+
+```
+  target = 离线契约桩  user = dify-player-1
+[1/3] health ................ ok
+[2/3] add memory ............ ok (id=mem_mock_0001)
+[3/3] search memory ......... ok (hit=1, top_score=0.9312)
+      top: 我今天说要每天跑步，从明天开始
+PASS
+      写入的记忆 mem_mock_0001 可被立即检索；跨会话复用时带同一 user_id=dify-player-1 即可召回
+```
+
+**B. 连真实服务（需先 `docker compose up -d` 起 PowerContext）**
+
 ```bash
 export PC_BASE_URL=http://localhost:8848
 export PC_API_KEY=changeme
@@ -82,12 +109,15 @@ python scripts/smoke_test.py
 期望输出：
 
 ```
+  target = http://localhost:8848  user = dify-player-1
 [1/3] health ................ ok
-[2/3] add memory ............ ok (id=12)
+[2/3] add memory ............ ok (id=<uuid>)
 [3/3] search memory ......... ok (hit=1, top_score=0.xx)
-      top: 我今天说要每天跑步
+      top: 我今天说要每天跑步，从明天开始
 PASS
 ```
+
+退出码 0 表示 PASS、1 表示 FAILED，可直接接入 CI；失败时脚本会打印原始响应片段便于定位（而不是抛异常中断）。
 
 ### 5.2 三轮对话剧本（`examples/dialogue_playthrough.md`）
 
